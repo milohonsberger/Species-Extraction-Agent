@@ -1,0 +1,14 @@
+# Environment
+venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Output files
+*.xlsx
+
+# PDFs (remove this line if you want to track input PDFs)
+*.pdf
