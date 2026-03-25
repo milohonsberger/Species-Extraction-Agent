@@ -1,16 +1,15 @@
 """
 Biological Report Extractor
 ============================
-Uses LlamaParse (for PDF parsing) + Google ADK (for agent/LLM extraction)
+Uses pypdf (for PDF parsing) + Google ADK (for agent/LLM extraction)
 to extract structured fields from biological/environmental PDF reports
 and write them to an Excel file.
 
 Requirements:
-    pip install llama-parse llama-index-core google-adk google-genai openpyxl python-dotenv
+    pip install pypdf google-adk google-genai openpyxl python-dotenv
 
 Setup:
     Create a .env file in this folder with:
-        LLAMA_CLOUD_API_KEY=your_llamaparse_key
         GOOGLE_API_KEY=your_gemini_key
 """
 
@@ -20,16 +19,11 @@ import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Pypdf
 from pypdf import PdfReader
-
-# Google ADK
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
-
-# Excel output
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
@@ -43,7 +37,6 @@ PDF_PATH = r"C:\pdf_agent\dsd_biological-technical-report_1.pdf"   # <-- change 
 OUTPUT_EXCEL = "bio_report_output.xlsx"
 GEMINI_MODEL = "gemini-2.0-flash"
 
-# Summary fields only — species handled separately
 FIELDS = {
     "Title":            "The full title of the report",
     "Author":           "The person or agency who wrote/prepared the report",
@@ -136,89 +129,11 @@ Do not summarise. Do not skip rows. Every observed species must appear in your o
 
 
 # ─────────────────────────────────────────────
-# STEP 1: Parse PDF with pypdf
+# HELPERS
 # ─────────────────────────────────────────────
 
-def parse_pdf(pdf_path: str) -> str:
-    print(f"[1/3] Parsing PDF: {pdf_path}")
-    reader = PdfReader(pdf_path)
-    pages = []
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            pages.append(text)
-    full_text = "\n\n".join(pages)
-    print(f"    Parsed {len(pages)} pages, {len(full_text):,} characters")
-    return full_text
-
-# ─────────────────────────────────────────────
-# STEP 2: Extract fields with Google ADK Agent
-# ─────────────────────────────────────────────
-
-async def extract_fields_with_adk(report_text: str, target_sections: str = "") -> dict:
-    """Use Google ADK LlmAgent to extract structured fields from report text."""
-    print("[2/3] Running ADK agent extraction...")
-
-    
-
-    # Build the field descriptions string
-    field_descriptions = "\n".join(
-        f'- {key}: {desc}' for key, desc in FIELDS.items()
-    )
-    field_keys = json.dumps(list(FIELDS.keys()), indent=2)
-
-    # Truncate report text if very long
-    max_chars = 800_000
-    if len(report_text) > max_chars:
-        print(f"    Report truncated from {len(report_text):,} to {max_chars:,} chars")
-        report_text = report_text[:max_chars]
-
-    prompt = EXTRACTION_PROMPT.format(
-        report_text=report_text,
-        field_descriptions=field_descriptions,
-        field_keys=field_keys,
-    )
-
-    # Set up ADK agent
-    agent = LlmAgent(
-        name="bio_extractor",
-        model=GEMINI_MODEL,
-        description="Extracts structured fields from biological reports",
-        instruction="You are a precise data extractor. Always return valid JSON only.",
-        generate_content_config={"max_output_tokens": 8000},
-    )
-
-    session_service = InMemorySessionService()
-    await session_service.create_session(
-        app_name="bio_extractor",
-        user_id="user_1",
-        session_id="session_1",
-    )
-
-    runner = Runner(
-        agent=agent,
-        app_name="bio_extractor",
-        session_service=session_service,
-    )
-
-    # ── First pass: summary fields ──
-    message = genai_types.Content(
-        role="user",
-        parts=[genai_types.Part(text=prompt)]
-    )
-
-    response_text = ""
-    async for event in runner.run_async(
-        user_id="user_1",
-        session_id="session_1",
-        new_message=message,
-    ):
-        if event.is_final_response():
-            if event.content and event.content.parts:
-                response_text = event.content.parts[0].text
-            break
-
-    # Parse JSON response — find the first { ... } object in the output
+def parse_json_response(response_text: str) -> dict:
+    """Strip markdown fences and parse the first JSON object in a response."""
     raw = response_text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -233,58 +148,95 @@ async def extract_fields_with_adk(report_text: str, target_sections: str = "") -
     if not clean.endswith("}"):
         last_comma = clean.rfind('",')
         if last_comma > 0:
-            clean = clean[:last_comma+1]
+            clean = clean[:last_comma + 1]
         clean = clean + '\n"_truncated": "true"\n}'
 
+    return json.loads(clean)
+
+
+async def run_agent(runner, user_id, session_id, prompt_text) -> str:
+    """Send a prompt to the ADK runner and return the final response text."""
+    message = genai_types.Content(
+        role="user",
+        parts=[genai_types.Part(text=prompt_text)]
+    )
+    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=message):
+        if event.is_final_response():
+            if event.content and event.content.parts:
+                return event.content.parts[0].text
+    return ""
+
+
+# ─────────────────────────────────────────────
+# STEP 1: Parse PDF
+# ─────────────────────────────────────────────
+
+def parse_pdf(pdf_path: str) -> str:
+    print(f"[1/3] Parsing PDF: {pdf_path}")
+    reader = PdfReader(pdf_path)
+    pages = [page.extract_text() for page in reader.pages if page.extract_text()]
+    full_text = "\n\n".join(pages)
+    print(f"    Parsed {len(pages)} pages, {len(full_text):,} characters")
+    return full_text
+
+
+# ─────────────────────────────────────────────
+# STEP 2: Extract fields with Google ADK Agent
+# ─────────────────────────────────────────────
+
+async def extract_fields_with_adk(report_text: str, target_sections: str = "") -> dict:
+    print("[2/3] Running ADK agent extraction...")
+
+    max_chars = 800_000
+    if len(report_text) > max_chars:
+        print(f"    Report truncated from {len(report_text):,} to {max_chars:,} chars")
+        report_text = report_text[:max_chars]
+
+    agent = LlmAgent(
+        name="bio_extractor",
+        model=GEMINI_MODEL,
+        description="Extracts structured fields from biological reports",
+        instruction="You are a precise data extractor. Always return valid JSON only.",
+        generate_content_config={"max_output_tokens": 8000},
+    )
+
+    session_service = InMemorySessionService()
+    runner = Runner(agent=agent, app_name="bio_extractor", session_service=session_service)
+
+    # First pass: summary fields
+    await session_service.create_session(app_name="bio_extractor", user_id="user_1", session_id="session_1")
+    field_descriptions = "\n".join(f'- {key}: {desc}' for key, desc in FIELDS.items())
+    field_keys = json.dumps(list(FIELDS.keys()), indent=2)
+    prompt = EXTRACTION_PROMPT.format(
+        report_text=report_text,
+        field_descriptions=field_descriptions,
+        field_keys=field_keys,
+    )
+
+    response_text = await run_agent(runner, "user_1", "session_1", prompt)
     try:
-        extracted = json.loads(clean)
+        extracted = parse_json_response(response_text)
         print(f"    Extracted {len(extracted)} fields successfully")
     except json.JSONDecodeError as e:
         print(f"    WARNING: Could not parse JSON response: {e}")
         print(f"    Raw response:\n{response_text[:500]}")
         extracted = {k: "EXTRACTION FAILED - check raw output" for k in FIELDS}
 
-    # ── Second pass: species only ──
+    # Second pass: species
     print("    Running second pass for species extraction...")
-    await session_service.create_session(
-        app_name="bio_extractor",
-        user_id="user_1",
-        session_id="session_2",
-    )
+    await session_service.create_session(app_name="bio_extractor", user_id="user_1", session_id="session_2")
     species_prompt = SPECIES_PROMPT.format(
         report_text=report_text,
         target_sections=target_sections if target_sections else "the entire document",
     )
 
-    message2 = genai_types.Content(
-        role="user",
-        parts=[genai_types.Part(text=species_prompt)]
-    )
-
-    response_text2 = ""
-    async for event in runner.run_async(
-        user_id="user_1",
-        session_id="session_2",
-        new_message=message2,
-    ):
-        if event.is_final_response():
-            if event.content and event.content.parts:
-                response_text2 = event.content.parts[0].text
-            break
-
-    clean2 = response_text2.strip()
-    if clean2.startswith("```"):
-        clean2 = clean2.split("```")[1]
-        if clean2.startswith("json"):
-            clean2 = clean2[4:]
-    clean2 = clean2.strip()
-
+    response_text2 = await run_agent(runner, "user_1", "session_2", species_prompt)
     try:
-        species_data = json.loads(clean2)
+        species_data = parse_json_response(response_text2)
         extracted["Species_Names"] = species_data.get("Species_Names", "NOT FOUND")
-        print(f"    Species pass complete")
+        print("    Species pass complete")
     except json.JSONDecodeError:
-        print(f"    WARNING: Species pass failed")
+        print("    WARNING: Species pass failed")
         extracted["Species_Names"] = "NOT FOUND"
 
     return extracted
@@ -295,7 +247,6 @@ async def extract_fields_with_adk(report_text: str, target_sections: str = "") -
 # ─────────────────────────────────────────────
 
 def write_to_excel(extracted: dict, output_path: str, source_pdf: str):
-    """Write extracted fields to a formatted Excel file."""
     print(f"[3/3] Writing results to: {output_path}")
 
     wb = openpyxl.Workbook()
@@ -313,7 +264,7 @@ def write_to_excel(extracted: dict, output_path: str, source_pdf: str):
         top=Side(style="thin", color="CCCCCC"),
     )
 
-    # ── Sheet 1: Report Summary ──────────────────────────────
+    # Sheet 1: Report Summary
     ws = wb.active
     ws.title = "Report Summary"
 
@@ -338,22 +289,19 @@ def write_to_excel(extracted: dict, output_path: str, source_pdf: str):
     row = 5
     for field_key in FIELDS:
         value = extracted.get(field_key, "NOT FOUND")
-
         ws.cell(row=row, column=1, value=field_key.replace("_", " ")).font = field_font
         ws.cell(row=row, column=1).alignment = wrap
         ws.cell(row=row, column=1).border = thin_border
-
         ws.cell(row=row, column=2, value=value).font = value_font
         ws.cell(row=row, column=2).alignment = wrap
         ws.cell(row=row, column=2).border = thin_border
-
         ws.row_dimensions[row].height = max(20, min(80, len(str(value)) // 3))
         row += 1
 
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 80
 
-    # ── Sheet 2: Species List ──────────────────────────
+    # Sheet 2: Species List
     ws2 = wb.create_sheet("Species List")
 
     ws2.merge_cells("A1:C1")
@@ -369,7 +317,6 @@ def write_to_excel(extracted: dict, output_path: str, source_pdf: str):
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
 
-    # Parse species list
     raw_species = extracted.get("Species_Names", "NOT FOUND")
     if isinstance(raw_species, list) and len(raw_species) > 0:
         species_list = [(s.get("name", ""), s.get("source", "")) for s in raw_species]
@@ -417,7 +364,7 @@ async def main():
     print("  Biological Report Field Extractor")
     print("=" * 55)
 
-   # 1. Parse PDF
+    # 1. Parse PDF
     report_text = parse_pdf(PDF_PATH)
 
     # 2. Ask user for target sections
@@ -433,7 +380,7 @@ async def main():
     # 3. Extract with ADK agent
     extracted = await extract_fields_with_adk(report_text, target_sections)
 
-    # Print preview
+    # 4. Print preview
     print("\n-- Extraction Preview --")
     for key, val in extracted.items():
         if key == "Species_Names":
@@ -443,7 +390,7 @@ async def main():
             preview = str(val)[:120] + "..." if len(str(val)) > 120 else str(val)
             print(f"  {key}: {preview}")
 
-    # 3. Write to Excel
+    # 5. Write to Excel
     write_to_excel(extracted, OUTPUT_EXCEL, PDF_PATH)
 
     print("\nDone! Open", OUTPUT_EXCEL, "to review results.")
